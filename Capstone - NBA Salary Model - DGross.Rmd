@@ -1,0 +1,510 @@
+---
+title: "HarvardX Data Science Capstone - NBA Salary Report"
+author: "Daniel Gross"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#list of packages
+packages_to_install <- c("dplyr", "tidyverse", "psych", "data.table", "rvest", "ggplot2", "caret", "corrplot", "randomForest")
+
+#automatic installation & loading of packages
+for (package in packages_to_install) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package)
+    library(package, character.only = TRUE)
+  } else {
+    library(package, character.only = TRUE)
+  }
+}
+```
+
+## Introduction
+
+The capstone for HarvardX's data science certification is to create your own model. The following report will detail the process of creating a model that predicts the salary of NBA players based on their performance. The NBA stats were acquired from a dataset on kaggle, which I uploaded to my own github repository. The salary information was scraped from a website, hoopshype. I limited my data to the career of Lebron James, 2004 to 2023, as both the game and the business of basketball have changed drastically during his career. 
+
+The report includes sections on: a data overview, the project's goal, setting up the data, exploring the data and insights gained, and creating and evaluating the model.
+
+## Data Overview
+
+The data set from kaggle had many tables. I wanted players performance to be more comparable so I limited player data to two types of stats: per 36 minute stats as well as advanced stats. Per 36 minute stats are stats divided by minutes played for that player then multiplied by 36 to try and account for players that see more or less playing time. Many of the advanced stats also try and make players more comparable, but go beyond just dividing and multiplying a single stat usually. Definitions for all of the player stats can be found in basketball reference's glossary. With the data on my own github repository, I was able to have the files automatically downloaded and placed in a folder in the home directory using the following code.
+
+```{r github automatic download}
+#download data from github
+# Set the URL of the raw CSV file on GitHub
+github_csv_url1 <- "https://raw.githubusercontent.com/dgross55/edxcapstone-NBA-pay-and-performance/main/Per%2036%20Minutes.csv"
+github_csv_url2 <- "https://raw.githubusercontent.com/dgross55/edxcapstone-NBA-pay-and-performance/main/Advanced.csv"
+# Set the destination folder where you want to save the dataset
+destination_folder <- "data/"
+# Create the destination folder if it doesn't exist
+if (!dir.exists(destination_folder)) {
+  dir.create(destination_folder, recursive = TRUE)
+}
+# Use the download.file function to download the datasets
+download.file(github_csv_url1, destfile = file.path(destination_folder, "Per 36 Minutes.csv"), mode = "wb")
+download.file(github_csv_url2, destfile = file.path(destination_folder, "Advanced.csv"), mode = "wb")
+#grab the specific datasets
+player_per36 <- fread("data/Per 36 Minutes.csv")
+player_advanced <- fread("data/Advanced.csv")
+```
+
+## Project Goal
+
+The goal of this project is to predict the salary of NBA players based on their performance. This information could then identify players that are performing better than their salary would suggest they should or be used to justify a smaller contract in the future if performance is not up to the level of pay.
+
+## Setting Up The Data
+
+As mentioned previously, my data was sourced from multiple sites: kaggle & hoopshype. To acquire the data from hoopshype, I used a for loop to scrape multiple pages of salary information. The following code was used for the for loop. I also included a fail safe to download the salary data from my github repository as hoopshype sometimes returned blank pages when scraping leading to errors.
+
+```{r salary for loop}
+#scrape for player salaries
+#for loop years, links, & empty table
+seasons1 <- seq(2003,2022)
+seasons2 <- seq(2004,2023)
+colseasons <- sprintf("%02d", 4:23)
+link <- paste0("https://hoopshype.com/salaries/players/",seasons1,"-",seasons2,"/")
+num_links <- length(link)
+salaries <- data.frame()
+
+#create handle_error function
+handle_error <- function(page) {
+  cat("Error processing value:", page, "\n")
+  cat("Downloading CSV from GitHub...\n")
+  
+  # URL of the Salaries CSV file on GitHub
+  githubfs_csv_url <- "https://raw.githubusercontent.com/dgross55/edxcapstone-NBA-pay-and-performance/main/Salaries.csv"
+  # Set the destination folder where you want to save the dataset
+  destination_folder <- "data/"
+  # Download the dataset
+  download.file(githubfs_csv_url, destfile = file.path(destination_folder, "Salaries.csv"), mode = "wb")
+  # Import downloaded dataset
+  salaries2 <- fread("data/Salaries.csv")
+}
+
+#flag to tell the loop to continue or not
+continue_loop <- TRUE
+
+#scraper for loop for player salaries
+scraper <- for(page in 1:num_links){
+  if (!continue_loop){
+    break
+  }
+  #error handling since hoopshype not always reliable
+  tryCatch({
+  #to track for loop progress
+  cat("Processing value:", page, "\n")
+  #read the page
+  sal <- read_html(link[page])
+  #get the table
+  sal <- sal |> html_table(header = TRUE)
+  #make it a data frame
+  sal <- as.data.frame(sal)
+  #dynamic column names based on current loop
+  current_column <- paste0("X",seasons1[page],".",colseasons[page],"...")
+  #specify columns & rename
+  sal <- select(sal, Player, !!as.name(current_column)) %>%
+    rename("Salary" = !!as.name(current_column))
+  #add the season to the table
+  sal <- cbind(sal, Season = seasons2[page])
+  
+  #add output to data frame
+  salaries <- rbind(salaries, sal)
+  
+  #to track for loop progress
+  cat("Finished processing value:", page, "\n\n")
+  }, 
+  #error handling to just get the dataset from github repository
+  error = function(e) {
+    salaries <- handle_error(page)
+    assign("continue_loop", FALSE, envir = .GlobalEnv) #set at global environment so that the for loop stops
+  })
+}
+```
+
+Once I had the salary information, I needed to ensure the column names matched the other data tables for easier combining & I also needed to convert the salary information from a character to a numeric as well as remove the leading dollar sign and the separating commas. The code below shows these two cleaning steps. These steps are not necessary if the data was downloaded from the github repository.
+
+```{r salary cleaning}
+#change salaries column names to all lowercase to match other tables
+colnames(salaries) <- tolower(colnames(salaries))
+#convert salary column from character to numeric (take out $ signs and ,)
+salaries$salary <- as.numeric(gsub("[\\$,]", "", salaries$salary))
+```
+
+Next, I combined the player_per36 data and the player_advanced data into a single table, which I then combined with the salary information. This left me with 10,842 observations for 55 different variables. 
+
+```{r combining tables}
+#combine tables
+#list common columns
+common_cols <- c("seas_id", "season", "player_id", "player", "birth_year", "pos", "age", "experience", "lg", "tm", "g", "mp")
+#get list of cols from player_advanced that are not common to both tables
+padvanced_desired_cols <- setdiff(names(player_advanced), common_cols)
+#create data frame that has values to join on, seas_id & player_id, and cols that are unique to player_advanced
+player_advanced_sel <- player_advanced %>%
+  select("seas_id", "player_id", padvanced_desired_cols)
+#combine desired player_advanced cols & per36
+player_stats <- merge(
+  player_per36, 
+  player_advanced_sel, 
+  by = c("seas_id", "player_id")
+  )
+#combine player_stats & salaries, only keep rows that match, 31633 obs to 10842 obs
+player_stats_sals <- merge(
+  player_stats,
+  salaries,
+  by = c("player", "season")
+)
+
+#summary of table
+summary(player_stats_sals)
+```
+
+My last data processing was to get rid of NAs. The whole birth_year column from the player_stats was empty, so I got rid of it, reducing my data set to 54 variables, and I also got rid of any other NA values. 
+
+```{r data processing}
+#data preprocessing
+#NAs
+missing_values <- sapply(player_stats_sals, function(x) sum(is.na(x)))
+print(missing_values)
+
+#remove all NAs - 10842 obs to 9100
+player_stats_sals <- player_stats_sals %>% select(-birth_year)
+player_stats_sals <- na.omit(player_stats_sals)
+
+#remove tables & objects no longer needed
+rm(player_advanced, player_advanced_sel, player_per36, player_stats, sal, colseasons, 
+   common_cols, current_column, link, num_links, package, packages_to_install,
+   padvanced_desired_cols, page, scraper, seasons1, seasons2, missing_values, destination_folder,
+   github_csv_url1, github_csv_url2)
+```
+
+In some instances, the NAs are valid, for example players who do not shoot any 3 pointers having an NA x3p_percent, but I still decided to remove them from my data set for simplicity. This reduced my data set from 10,842 observations to 9,100.
+
+## Exploring The Data & Insights
+
+My next step was to explore each of the variables in the data set. Since my data spanned multiple NBA seasons, I was  curious if any of these stats have changed over time. In most instances I looked at the stat for all players and all seasons as well as a by season variation. Here is a list of all of the variables in the data set.
+
+```{r data set variables}
+colnames(player_stats_sals)
+```
+
+#### Age
+
+I started with demographic data first, specifically age. Twenty-three is the most frequent age in the data set, while the mean is slightly over 26. However, when you break it out by season, there are some seasons, such as 2016, where 24-26 are the highest frequency ages. I was mostly curious to see if we saw the average age growing over time, but for the most part, the curve slopes down from 23 or 24.
+
+```{r age}
+player_stats_sals[, .(players = .N), by = age][, age := factor(age)][
+  , ggplot(.SD, aes(age, players)) +
+    geom_col(fill = "black", color = "white") +
+    labs(title = "Player Age Frequency",
+         x = "Age",
+         y = "Frequency")]
+
+player_stats_sals[, .(players = .N), by = .(season, age)][, age := factor(age)][
+  , ggplot(.SD, aes(age, players, fill = as.factor(age))) +
+    geom_col(fill = "black", color = "white") +
+    facet_wrap(~season, scales = "free_y", ncol = 4) +
+    labs(title = "Player Age Frequency by Season",
+         x = "Age",
+         y = "Frequency")]
+
+describe(player_stats_sals [ , c('age')], fast=TRUE)
+```
+
+#### Experience
+
+Another demographic stat I was interested in was experience. Experience represents how many years a player has played in the NBA in this data set. It is not surprising that 1 year has the highest frequency. There are many players that get drafted, but then do not remain in the NBA for a variety of reasons. When broken down by season, the experience curves look similar in that they generally peak at 1 or 2 years and then slope down from there. However, there are definitely years where the NBA is more veteran heavy, like 2019.
+
+```{r experience}
+player_stats_sals[, .(players = .N), by = experience][, experience := factor(experience)][
+  , ggplot(.SD, aes(experience, players)) +
+    geom_col(fill = "black", color = "white") +
+    labs(title = "Player Experience Frequency",
+         x = "Experience",
+         y = "Frequency")]
+
+player_stats_sals[, .(players = .N), by = .(season, experience)][, experience := factor(experience)][
+  , ggplot(.SD, aes(experience, players, fill = as.factor(experience))) +
+    geom_col(fill = "black", color = "white") +
+    facet_wrap(~season, scales = "free_y", ncol = 4) +
+    labs(title = "Player Experience Frequency by Season",
+         x = "Experience",
+         y = "Frequency")]
+
+describe(player_stats_sals [ , c('experience')], fast=TRUE) 
+```
+
+I looked at other demographic stats, but thought these two were the most interesting to share.
+
+#### FG per 36 Minutes
+
+Next, I explored the per 36 minutes stats. I started with field goals, which includes both 2 point and 3 point field goals, per 36 minutes. When looking at all seasons combined, slightly above 5 was the highest frequency. I was curious if field goals per 36 min had gone up over time, but when plotting box plots by season, we can see the mean has gone up slightly, but all of the interquartile ranges overlap, so there hasn't been a large, meaningful shift.
+
+```{r FG_per_36_min}
+player_stats_sals[, .(fg_per_36_min)] %>%
+  ggplot(aes(x = fg_per_36_min)) +
+  geom_density(fill = "black", color = "white", alpha = 0.7) +
+  labs(title = "Field Goals Per 36 Min Frequency",
+       x = "Field Goals Per 36 Min",
+       y = "Frequency")
+
+player_stats_sals[, season := factor(season)][
+  , ggplot(.SD, aes(x = season, y = fg_per_36_min)) +
+    geom_boxplot(fill = "black", color = "black", alpha = 0.7) +
+    labs(title = "Field Goals Per 36 Min by Season",
+         x = "Season",
+         y = "Field Goal Per 36 Min")]
+```
+
+#### Pts per 36 Minutes
+
+I explored all of the per 36 minutes stats, but I also wanted to share points per 36 minutes. This stat is very similar to the FG per 36 minutes, but instead of the count of field goals, it is the point totals, so the sum of the 2 point and 3 point field goals per 36 minutes. When looking at all seasons combined, around 13 points is the highest frequency. When broken out by season, similar to field goals per 36 minutes, we see the mean generally going up, but again the interquartile ranges are overlapping.
+
+```{r Pts_per_36_min}
+player_stats_sals[, .(pts_per_36_min)] %>%
+  ggplot(aes(x = pts_per_36_min)) +
+  geom_density(fill = "black", color = "white", alpha = 0.7) +
+  labs(title = "Points Per 36 Min Frequency",
+       x = "Points Per 36 Min",
+       y = "Frequency")
+
+player_stats_sals[, season := factor(season)][
+  , ggplot(.SD, aes(x = season, y = pts_per_36_min)) +
+    geom_boxplot(fill = "black", color = "black", alpha = 0.7) +
+    labs(title = "Points Per 36 Min by Season",
+         x = "Season",
+         y = "Points Per 36 Min")]
+```
+
+I looked at other per 36 minute stats, but wanted to share these as they were found to have a high correlation with salary, which will be important for our model later.
+
+#### Player Efficiency Rating (PER)
+
+Next, I explored the advanced stats. Similar to the per 36 minute stats, I was interested in how the whole data set looked as well as when breaking it out by season. The first advanced stat I looked at was PER. This stat was developed by John Hollinger and is said to sum up all a player's positive accomplishments, subtracts the negative accomplishments, and returns a per-minute rating of a player's performance. The mean PER is slightly above 13. When we break this stat out by season, we see the interquartile range and mean have stayed incredibly static, which means this stat is very helpful in comparing players across seasons.
+
+```{r PER}
+player_stats_sals[, .(per)] %>%
+  ggplot(aes(x = per)) +
+  geom_density(fill = "black", color = "white", alpha = 0.7) +
+  labs(title = "Player Efficiency Rating Frequency",
+       x = "Player Efficiency Rating",
+       y = "Frequency")
+
+player_stats_sals[, season := factor(season)][
+  , ggplot(.SD, aes(x = season, y = per)) +
+    geom_boxplot(fill = "black", color = "black", alpha = 0.7) +
+    labs(title = "Player Efficiency Rating by Season",
+         x = "Season",
+         y = "Player Efficiency Rating")]
+
+describe(player_stats_sals [ , c('per')], fast=TRUE)
+```
+
+#### Win Shares (WS)
+
+Another advanced stat I explored was win shares. Win shares is an estimate of the number of wins contributed by a player. This stat is biased towards players that play more minutes, but you would also expect those players to have a higher salary. The mean win share is 2.44. This stat has stayed fairly static over the seasons, so this is another good way to compare players across seasons.
+
+```{r WS}
+player_stats_sals[, .(ws)] %>%
+  ggplot(aes(x = ws)) +
+  geom_density(fill = "black", color = "white", alpha = 0.7) +
+  labs(title = "Win Shares Frequency",
+       x = "Win Shares",
+       y = "Frequency")
+
+player_stats_sals[, season := factor(season)][
+  , ggplot(.SD, aes(x = season, y = ws)) +
+    geom_boxplot(fill = "black", color = "black", alpha = 0.7) +
+    labs(title = "Win Shares by Season",
+         x = "Season",
+         y = "Win Shares")]
+
+describe(player_stats_sals [ , c('ws')], fast=TRUE)
+```
+
+#### Box Plus/Minus (BPM)
+
+Box Plus/Minus is a box score estimate of the points per 100 possessions that a player contributed above a league-average player, translated to an average team. The mean BPM is -1.3, meaning most players contribute less than the league-average player. This makes sense when you think about that rosters have around 15 players, but only 5 can play at a time. Similar to PER and WS, BPM is very static season to season, meaning it is another good way to compare players across seasons.
+
+```{r BPM}
+player_stats_sals[, .(bpm)] %>%
+  ggplot(aes(x = bpm)) +
+  geom_density(fill = "black", color = "white", alpha = 0.7) +
+  labs(title = "Box Plus/Minus Frequency",
+       x = "Box Plus/Minus",
+       y = "Frequency")
+
+player_stats_sals[, season := factor(season)][
+  , ggplot(.SD, aes(x = season, y = bpm)) +
+    geom_boxplot(fill = "black", color = "black", alpha = 0.7) +
+    labs(title = "Box Plus/Minus by Season",
+         x = "Season",
+         y = "Box Plus/Minus")]
+
+describe(player_stats_sals [ , c('bpm')], fast=TRUE)
+```
+
+#### Value Over Replacement Player (VORP)
+
+Value over replacement player is a box score estimate of the points per 100 team possessions that a player contributed a replacement-level, -2.0, player, translated to an average team and prorated to an 82-game season. The mean VORP is 0.6. Similar to the other advanced stats, VORP is very consistent season to season making it another good season to season comparison for players.
+
+```{r VORP}
+player_stats_sals[, .(vorp)] %>%
+  ggplot(aes(x = vorp)) +
+  geom_density(fill = "black", color = "white", alpha = 0.7) +
+  labs(title = "Value Over Replacement Player Frequency",
+       x = "Value Over Replacement Player",
+       y = "Frequency")
+
+player_stats_sals[, season := factor(season)][
+  , ggplot(.SD, aes(x = season, y = vorp)) +
+    geom_boxplot(fill = "black", color = "black", alpha = 0.7) +
+    labs(title = "Value Over Replacement Player by Season",
+         x = "Season",
+         y = "Value Over Replacement Player")]
+
+describe(player_stats_sals [ , c('vorp')], fast=TRUE)
+```
+
+#### Salary
+
+Finally, salary is what we want our model to predict based on all the other performance measures available to us. The mean salary is \$7,331,112 with a standard deviation of \$8,307,602. Our aim will be to create a model that has a lower RMSE than the standard deviation. When we look at salary over the seasons, it is clear that the largest salaries have continued to grow, but generally the mean pay in the NBA is similar.
+
+```{r Salary}
+player_stats_sals[, .(salary)] %>%
+  ggplot(aes(x = salary)) +
+  geom_density(fill = "black", color = "white", alpha = 0.7) +
+  labs(title = "Salary Frequency",
+       x = "Salary",
+       y = "Frequency")
+
+player_stats_sals[, season := factor(season)][
+  , ggplot(.SD, aes(x = season, y = salary)) +
+    geom_boxplot(fill = "black", color = "black", alpha = 0.7) +
+    labs(title = "Salary by Season",
+         x = "Season",
+         y = "Salary")]
+
+describe(player_stats_sals [ , c('salary')], fast=TRUE)
+```
+
+## Correlation Plot
+
+My final exploration of the data was a correlation plot. I wanted to understand how the variables related to one another and which ones were highly correlated with salary. To do so, I needed remove any non-numeric variables from my data set. Once I had my correlation plot, I was able to sort the row for salary by correlation coefficient value so I could easily see which stats had the highest correlation coefficients.
+
+```{r Correlation Plot}
+#remove non-numeric variables for corrplot
+num_player_stats_sals <- player_stats_sals %>% select (-player, -season, -pos, -lg, -tm)
+
+cor_matrix <- cor(num_player_stats_sals)
+corrplot(cor_matrix, type = "upper", method = "ellipse", tl.cex = 0.9)
+
+#correlation coefficients for salary sorted by correlation
+sort(cor_matrix[49, ], decreasing = TRUE)
+```
+
+The top 10 correlation coefficients would be the basis for my first model.
+
+## Models
+
+Before starting on my models, I split my data into train and test with a 80/20 split. I chose 80/20 because I wanted a good amount of my data for training to prevent overfitting. It also allows for enough data available in test to understand how the model performs on unseen data.
+
+```{r train test split}
+set.seed(1991)
+split_index <- createDataPartition(player_stats_sals$salary, p = 0.8, list = FALSE)
+train <- player_stats_sals[split_index, ]
+test <- player_stats_sals[-split_index, ]
+```
+
+I decided I would create two different models: a more simple linear model based on the top 10 correlation coefficients from our previous correlation plot, and a random forest model that took into account all of the available stats. Many of the available stats have high colinearity, so I thought by limiting to the top 10 for the linear model, we might see decent performance without going too deep. However, I also wanted to use all the available data as well, which is why I landed on a random forest model.
+
+Below is the code to produce the linear model as well as the code I used to calculate RMSE for it.
+
+```{r linear model}
+linearm <- lm(salary ~ vorp + experience + ws + obpm + gs + pts_per_36_min + per + bpm + fg_per_36_min + ows, data = as.data.frame(train))
+summary(linearm)
+
+lm_sal_prediction <- predict(linearm, newdata = test)
+res <- test$salary - lm_sal_prediction
+lm_rmse <- sqrt(mean(res^2))
+print(lm_rmse)
+```
+
+The linear model using the top 10 correlation coefficients had a RMSE of \$5,898,770, which is less than standard deviation of salaries in the data set.
+
+I also created a table that contained the actual salary of a player, the predicted salary from the model, the difference between those two, as well as the player's name, the season, and the team the player was on. The table can be seen below.
+
+```{r linear model - actual vs pred}
+lm_results <- data.frame(
+  true_sal = test$salary,
+  modeled_sal = lm_sal_prediction,
+  sal_diff = test$salary - lm_sal_prediction,
+  player = test$player,
+  season = test$season,
+  team = test$tm
+)
+
+print(lm_results)
+```
+
+Next, I created a random forest model. The code to produce the model as well as the code to calculate RMSE for it is below.
+
+```{r random forest}
+rfm <- randomForest(salary ~ ., data = as.data.frame(train))
+print (rfm)
+
+rf_sal_pred <- predict(rfm, newdata = test)
+rf_rmse <- sqrt(mean((test$salary - rf_sal_pred)^2))
+print(rf_rmse)
+```
+
+The random forest model using all of the available data had a RMSE of \$4,343,795, which is also less than the standard deviation of the salaries in the data set. This is also an improvement over the more simple linear model.
+
+Similar to the linear model, I created a table that contained the actual salary, the predicted salary, the difference between them, as well as the player's name, the season, and the team the player was on. The table can be seen below.
+
+```{r random forest - actual vs pred}
+rf_results <- data.frame(
+  true_sal = test$salary,
+  modeled_sal = rf_sal_pred,
+  sal_diff = test$salary - rf_sal_pred,
+  player = test$player,
+  season = test$season,
+  team = test$tm
+)
+
+print(rf_results)
+```
+
+## Insights
+
+The main reason I created the tables with the actual salary and the predicted salary is because I wanted to look at how the models compared when looking at results for a specific player. I decided I would compare how the two models predicted salary for Kevin Durant because there were 5 seasons of data in the test set for him.
+
+```{r Kevin Durant model comparison}
+target_player <- "Kevin Durant"
+print(subset(lm_results, player == target_player))
+print(subset(rf_results, player == target_player))
+```
+
+Kevin Durant was the second pick in 2007, so the first season in the test set is while he was still on his rookie contract, a player's first 3 years in the NBA. Given that he was such a high draft pick, it is not surprising that both models predicted his salary to be higher than his rookie contract salary. However, the other four seasons in the test set, both models predicted his salary to be lower. The linear model had much lower salary predictions, creating much larger differentials between actual and modeled salary, the highest being in 2021 with a differential of \$23,297,996. The random forest model's largest differential was also in the 2021 season, but it was only a differential of \$4,878,567. Kevin Durant has become one of the faces of the NBA, so there are likely other non-performance reasons his salary is so high.
+
+## Conclusion
+
+While both models were able to have a RMSE lower than the standard deviation of the salaries in the data set, the more advanced random forest model did a better job of predicting salary based on on-court performance. There are many improvements that could be made to the model. For example, we could tune the tree depth, we could analyze feature importance and focus on which features contribute the most to the model's predictions.
+
+A limitation of the model is that it only focuses on on-court performance. An improvement would be to better understand players that received rewards, like most valuable player or all stars for example. This could potentially give the model some indication when a player's contributions go further than just their stats.
+
+\newpage
+
+## References
+
+1. Datta, S. (2024). *NBA/ABA/BAA Stats Dataset*. Kaggle. [https://www.kaggle.com/datasets/sumitrodatta/nba-aba-baa-stats](https://www.kaggle.com/datasets/sumitrodatta/nba-aba-baa-stats)
+
+2. HoopsHype. (2024). *NBA Players Salaries*. [https://hoopshype.com/salaries/players/](https://hoopshype.com/salaries/players/)
+
+3. Fadeaway World. (2023). *LeBron James Brilliantly Explains How the NBA Has Changed Since He First Entered the League*. [https://fadeawayworld.net/lebron-james-brilliantly-explains-how-the-nba-has-changed-since-he-first-entered-the-league](https://fadeawayworld.net/lebron-james-brilliantly-explains-how-the-nba-has-changed-since-he-first-entered-the-league)
+
+4. Basketball Reference. (2024). *Basketball Reference Glossary*. [https://www.basketball-reference.com/about/glossary.html](https://www.basketball-reference.com/about/glossary.html)
+
+5. ESPN. (2024). *Kevin Durant Player Stats*. [https://www.espn.com/nba/player/stats/_/id/3202/kevin-durant](https://www.espn.com/nba/player/stats/_/id/3202/kevin-durant)
